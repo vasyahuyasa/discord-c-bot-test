@@ -3,7 +3,7 @@
 all: build
 
 build:
-	gcc -o bot main.c -lwebsockets 
+	gcc -o bot main.c -lcurl
 
 clean:
 	rm bot
