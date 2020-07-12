@@ -4,9 +4,18 @@
 #include <string.h>
 #include <json-c/json.h>
 #include "auth.h"
+#include <time.h>
 
 #define APPLICATION_INFO_URL "https://discord.com/api/oauth2/applications/@me"
 #define GET_CHANNELS_URL "https://discord.com/api/channels"
+
+enum
+{
+    STATE_NONE = 0,
+    STATE_GETTING_CHANNEL_INFO,
+    STATE_WORKING,
+    STATE_ERROR,
+};
 
 struct string
 {
@@ -20,7 +29,12 @@ struct message
     char *content;
 };
 
-void init_string(struct string *s)
+struct channel
+{
+    char *last_message_id;
+}
+
+init_string(struct string *s)
 {
     s->len = 0;
     s->ptr = malloc(s->len + 1);
@@ -88,85 +102,168 @@ struct message *get_messags_reponse_to_list(const char *json_str, size_t *len)
     return messages;
 }
 
-int main()
+void get_channel_info(const char *json_str, struct channel *chan)
 {
-    CURL *curl;
-    CURLM *multi_handle;
-    CURLcode res;
-    int still_running = 0;
+    json_object *channel_obj = json_tokener_parse(json_str);
+    json_object *last_msg_obj = json_object_object_get(channel_obj, "last_message_id");
+    chan->last_message_id = json_object_get_string(last_msg_obj);
+}
 
-    struct string s;
+#define MAX_REQUESTS 50
 
-    init_string(&s);
+int state = STATE_NONE;
+CURLM *multi_handle;
+char *last_message_id;
+char *auth_header;
+char *channel_info_url;
+char *channel_messages_url;
+struct string channel_info_data = {NULL, 0};
+struct timespec last_message_time = {0, 0};
+struct discord_request *all_requests[MAX_REQUESTS];
+int running_queries = 0;
 
-    curl_global_init(CURL_GLOBAL_DEFAULT);
+#define CHECKINTERVAL_US (1000 * 500)
 
-    curl = curl_easy_init();
+typedef void (*result_cb)(CURLcode, struct string *);
 
-    struct curl_slist *headers = NULL;
-    headers = curl_slist_append(headers, BOT_AUTHORIZATION_HEADER);
+struct discord_request
+{
+    CURL *handle;
+    result_cb *cb;
+};
 
-    char messages_url[100];
-    sprintf(messages_url, "https://discord.com/api/channels/%s/messages\0", CHANNEL_ID);
+size_t run_request(struct discord_request *req)
+{
+    for (size_t i = 0; i < MAX_REQUESTS; i++)
+    {
+        if (all_requests[i] == NULL)
+        {
+            CURLMcode code = curl_multi_add_handle(multi_handle, req->handle);
+            if (code != CURLM_OK) {
+                printf("can not add ")
+            }
+            all_requests[i] = req;
+            running_queries++;
+            return i;
+        }
+    }
 
-    curl_easy_setopt(curl, CURLOPT_URL, messages_url);
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+    printf("can not enqueue query: queue is full");
+}
 
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writefunc);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &s);
+void discord_init()
+{
+    memset(all_requests, NULL, sizeof(struct discord_request *) * MAX_REQUESTS);
+
+    channel_info_url = malloc(100);
+    auth_header = malloc(100);
+    channel_messages_url = malloc(100);
+    memset(channel_info_url, 0, 100);
+    memset(auth_header, 0, 100);
+    memset(channel_messages_url, 0, 100);
+
+    sprintf(channel_info_url, "https://discord.com/api/channels/%s", CHANNEL_ID);
+    sprintf(auth_header, "Authorization: Bot %s", TOKEN);
+    sprintf(channel_messages_url, "https://discord.com/api/channels/%s/messages", CHANNEL_ID);
 
     multi_handle = curl_multi_init();
-    curl_multi_add_handle(multi_handle, curl);
-    curl_multi_perform(multi_handle, &still_running);
+}
 
-    do
+void process_channel_info(CURLcode code, struct string *result)
+{
+}
+
+void discord_run()
+{
+    if (running_queries > 0) {
+
+    }
+
+    switch (state)
+    {
+    case STATE_NONE:
+    {
+        CURL *handle = curl_easy_init();
+        struct curl_slist *header = curl_slist_append(NULL, auth_header);
+        struct string *buf = malloc(sizeof(struct string));
+
+        init_string(buf);
+
+        curl_easy_setopt(handle, CURLOPT_URL, channel_info_url);
+        curl_easy_setopt(handle, CURLOPT_HTTPHEADER, header);
+        curl_easy_setopt(handle, CURLOPT_WRITEFUNCTION, writefunc);
+        curl_easy_setopt(handle, CURLOPT_WRITEDATA, buf);
+
+        struct discord_request *req = malloc(sizeof(struct discord_request));
+        req->handle = handle;
+        req->cb = process_channel_info;
+
+        run_request(req);
+    }
+
+    case STATE_GETTING_CHANNEL_INFO:
     {
         CURLMcode mc;
-        int numfds;
+        int pending;
 
-        mc = curl_multi_perform(multi_handle, &still_running);
-
+        mc = curl_multi_perform(multi_handle, &pending);
         if (mc == CURLM_OK)
         {
-            /* wait for activity or timeout */
-            mc = curl_multi_poll(multi_handle, NULL, 0, 0, &numfds);
+            mc = curl_multi_poll(multi_handle, NULL, 0, 1, &pending);
         }
 
         if (mc != CURLM_OK)
         {
             fprintf(stderr, "curl_multi failed, code %d.\n", mc);
+            state = STATE_ERROR;
             break;
         }
 
-        printf("steel running\n");
-
-    } while (still_running);
-
-    /* See how the transfers went */
-    CURLMsg *msg;  /* for picking up messages with the transfer status */
-    int msgs_left; /* how many messages are left */
-    while ((msg = curl_multi_info_read(multi_handle, &msgs_left)))
-    {
-        if (msg->msg == CURLMSG_DONE)
+        if (pending != 0)
         {
-            if (msg->data.result != CURLE_OK) {
+            break;
+        }
+
+        CURLMsg *msg;
+        int msgs_left;
+        while ((msg = curl_multi_info_read(multi_handle, &msgs_left)))
+        {
+            if (msg->msg != CURLMSG_DONE)
+            {
+                continue;
+            }
+
+            if (msg->data.result != CURLE_OK)
+            {
                 printf("HTTP transfer completed with status %d", msg->data.result);
                 break;
             }
 
-            size_t msg_len;
-            struct message *messages;
+            struct channel *chan = malloc(sizeof(struct channel));
+            get_channel_info(channel_info_data.ptr, chan);
+            last_message_id = chan->last_message_id;
 
-            messages = get_messags_reponse_to_list(s.ptr, &msg_len);
-            for (int i = 0; i < msg_len; i++) {
-                struct message msg = messages[i];
-                printf("%s: %s\n", msg.from, msg.content);
-            }
-
+            printf("last_message_id=%s\n", last_message_id);
+            state = STATE_WORKING;
         }
+        break;
     }
 
-    return 0;
+    case STATE_WORKING:
+    {
+
+        exit(0);
+        break;
+    }
+    }
+}
+
+int main()
+{
+    discord_init();
+
+    while (1)
+    {
+        discord_run();
+    }
 }
