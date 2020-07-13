@@ -118,18 +118,20 @@ char *auth_header;
 char *channel_info_url;
 char *channel_messages_url;
 struct string channel_info_data = {NULL, 0};
-struct timespec last_message_time = {0, 0};
+struct timespec next_message_check = {0, 0};
 struct discord_request *all_requests[MAX_REQUESTS];
 int running_queries = 0;
+int got_channel_info = 0;
 
 #define CHECKINTERVAL_US (1000 * 500)
 
-typedef void (*result_cb)(CURLcode, struct string *);
+typedef void(result_cb)(CURLcode, struct string *);
 
 struct discord_request
 {
     CURL *handle;
     result_cb *cb;
+    struct string *data;
 };
 
 size_t run_request(struct discord_request *req)
@@ -139,21 +141,28 @@ size_t run_request(struct discord_request *req)
         if (all_requests[i] == NULL)
         {
             CURLMcode code = curl_multi_add_handle(multi_handle, req->handle);
-            if (code != CURLM_OK) {
-                printf("can not add ")
+            if (code != CURLM_OK)
+            {
+                printf("can not add handle: code %d\n", code);
             }
+
             all_requests[i] = req;
             running_queries++;
             return i;
         }
     }
 
-    printf("can not enqueue query: queue is full");
+    printf("can not enqueue query: queue is full\n");
 }
 
 void discord_init()
 {
-    memset(all_requests, NULL, sizeof(struct discord_request *) * MAX_REQUESTS);
+
+    //memset(&all_requests, 0, sizeof(struct discord_request *) * MAX_REQUESTS);
+    for (size_t i = 0; i < MAX_REQUESTS; i++)
+    {
+        all_requests[i] = NULL;
+    }
 
     channel_info_url = malloc(100);
     auth_header = malloc(100);
@@ -169,14 +178,69 @@ void discord_init()
     multi_handle = curl_multi_init();
 }
 
-void process_channel_info(CURLcode code, struct string *result)
+void process_channel_info(CURLcode code, struct string *data)
 {
+    struct channel *ch_info = malloc(sizeof(struct channel));
+    get_channel_info(data->ptr, ch_info);
+
+    last_message_id = ch_info->last_message_id;
+    got_channel_info = 1;
+}
+
+int need_check_messages()
+{
+
 }
 
 void discord_run()
 {
-    if (running_queries > 0) {
+    CURLMcode mc;
 
+    mc = curl_multi_perform(multi_handle, &running_queries);
+    if (mc == CURLM_OK)
+    {
+        mc = curl_multi_poll(multi_handle, NULL, 0, 1, &running_queries);
+    }
+
+    if (mc != CURLM_OK)
+    {
+        fprintf(stderr, "curl_multi failed: code %d\n", mc);
+        state = STATE_ERROR;
+        return;
+    }
+
+    CURLMsg *msg;
+    int msgs_left;
+    while ((msg = curl_multi_info_read(multi_handle, &msgs_left)))
+    {
+        if (msg->msg != CURLMSG_DONE)
+        {
+            continue;
+        }
+
+        if (msg->data.result != CURLE_OK)
+        {
+            printf("HTTP transfer completed with status %d\n", msg->data.result);
+            break;
+        }
+
+        int found = 0;
+        for (size_t i = 0; i < MAX_REQUESTS; i++)
+        {
+            if (msg->easy_handle == all_requests[i]->handle)
+            {
+                all_requests[i]->cb(msg->data.result, all_requests[i]->data);
+                running_queries--;
+                all_requests[i] = NULL;
+                found = 1;
+                break;
+            }
+        }
+
+        if (found == 0)
+        {
+            printf("warn: data from unknown handler %X\n", msg->easy_handle);
+        }
     }
 
     switch (state)
@@ -196,54 +260,17 @@ void discord_run()
 
         struct discord_request *req = malloc(sizeof(struct discord_request));
         req->handle = handle;
-        req->cb = process_channel_info;
+        req->cb = &process_channel_info;
+        req->data = buf;
 
         run_request(req);
+        state = STATE_GETTING_CHANNEL_INFO;
     }
 
     case STATE_GETTING_CHANNEL_INFO:
     {
-        CURLMcode mc;
-        int pending;
-
-        mc = curl_multi_perform(multi_handle, &pending);
-        if (mc == CURLM_OK)
+        if (got_channel_info == 1)
         {
-            mc = curl_multi_poll(multi_handle, NULL, 0, 1, &pending);
-        }
-
-        if (mc != CURLM_OK)
-        {
-            fprintf(stderr, "curl_multi failed, code %d.\n", mc);
-            state = STATE_ERROR;
-            break;
-        }
-
-        if (pending != 0)
-        {
-            break;
-        }
-
-        CURLMsg *msg;
-        int msgs_left;
-        while ((msg = curl_multi_info_read(multi_handle, &msgs_left)))
-        {
-            if (msg->msg != CURLMSG_DONE)
-            {
-                continue;
-            }
-
-            if (msg->data.result != CURLE_OK)
-            {
-                printf("HTTP transfer completed with status %d", msg->data.result);
-                break;
-            }
-
-            struct channel *chan = malloc(sizeof(struct channel));
-            get_channel_info(channel_info_data.ptr, chan);
-            last_message_id = chan->last_message_id;
-
-            printf("last_message_id=%s\n", last_message_id);
             state = STATE_WORKING;
         }
         break;
@@ -251,7 +278,7 @@ void discord_run()
 
     case STATE_WORKING:
     {
-
+        printf("last_message_id=%s\n", last_message_id);
         exit(0);
         break;
     }
